@@ -1,0 +1,15 @@
+[Unit]
+Description=GPU-aware iLO 4 fan floors (ilo-fan)
+Wants=network-online.target
+After=network-online.target gpu-power-limit.service
+
+[Service]
+# Root is needed for nvidia-smi -pl (the failsafe) and the key in /etc/ilo-fan.
+ExecStart=/opt/ilo-fan/venv/bin/python /opt/ilo-fan/ilo_fan.py --config /etc/ilo-fan/ilo-fan.toml run
+Restart=always
+RestartSec=15
+# Leaves the fans at park_pct on stop; give the iLO time to take 6 SSH commands.
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,43 @@
+# /etc/ilo-fan/ilo-fan.toml
+# Anything left out uses the defaults at the top of ilo_fan.py.
+
+[ilo]
+host = "192.0.2.10"            # your iLO's IP address
+user = "fanctl"                # iLO user whose SSH key is /etc/ilo-fan/id_rsa.pub
+key = "/etc/ilo-fan/id_rsa"
+known_hosts = "/etc/ilo-fan/known_hosts"
+# 0-based fan numbers: 0 = "Fan 1" in the iLO web page. Limit this to the fans
+# in front of the GPU's riser once you know which ones they are.
+fans = [0, 1, 2, 3, 4, 5]
+release_pwm = 20               # 20/255 = 8 %, below the stock idle speed
+
+[control]
+target_c = 70                  # GPU temperature to hold under load
+emergency_c = 84               # all configured fans to 100 % at or above this
+ambient_c = 22                 # inlet air estimate; raise it in summer
+steps_pct = [0, 30, 40, 50, 65, 80, 100]   # 0 = stock iLO behavior
+hold_s = 120                   # keep the floor this long after load stops
+step_down_every_s = 30
+park_pct = 45                  # floor left behind when the service stops
+
+[model]
+# Measured on the CGW DL380 Gen9 + V100 SXM2. Recalibrate for other hardware
+# (see README, "Tuning").
+rth_ref_c_per_w = 0.307
+f_ref_pct = 43
+k = 1.16
+
+[anticipate]
+# vLLM's Prometheus endpoint. Fans start as soon as a request is queued,
+# before GPU power or temperature rise. Leave empty if you don't run vLLM.
+vllm_metrics_url = "http://127.0.0.1:8000/metrics"
+busy_power_w = 150             # expected draw while a request runs
+
+[failsafe]
+enabled = true
+hot_c = 82                     # iLO unreachable and GPU this hot: cap power
+normal_limit_w = 150
+reduced_limit_w = 100
+
+[log]
+csv = ""                       # e.g. "/var/log/ilo-fan.csv" while tuning
