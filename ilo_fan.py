@@ -7,7 +7,7 @@ the controller would do.
 
 The iLO cannot see third-party GPU temperatures, so its fans ignore GPU heat. This
 script reads the GPUs with nvidia-smi (and optionally vLLM's request count), predicts
-where the GPU temperature is heading, and raises the iLO's per-fan *minimum* speed
+from GPU power what fan speed holds the target temperature, and raises the iLO's per-fan *minimum* speed
 (`fan p N min X`). It never lowers a maximum, so the iLO's own control loops still
 work on top and can always spin the fans faster.
 
@@ -46,14 +46,12 @@ DEFAULTS = {
         "interval_s": 2.0,       # how often GPUs are read (local, cheap)
         "target_c": 70.0,        # GPU temperature to hold under load
         "emergency_c": 84.0,     # at or above this: all configured fans 100%
-        "ambient_c": 22.0,       # room/inlet air estimate (conservative)
-        "steps_pct": [0, 30, 40, 50, 65, 80, 100],  # 0 = stock iLO curve
+        "ambient_c": 25.0,       # effective air temperature at the GPUs (fitted; inlet
+                                 # was 19 C, the rest is preheat inside the chassis)
+        "steps_pct": [0, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80, 100],  # 0 = stock iLO curve
+        "power_tau_s": 20.0,     # smoothing for the power feedforward (prefill spikes)
         "hold_s": 120,           # wait after the last high demand before stepping down
         "step_down_every_s": 30, # then step down one level at a time
-        "lookahead_s": 30,       # predict temperature this far ahead from the trend
-        "kp_pct_per_c": 4.0,     # extra floor per degree of predicted overshoot
-        "push_within_c": 10.0,   # push only once the GPU is this close to target
-                                 # (a load step's first seconds extrapolate far too hot)
         "ki_pct_per_c_s": 0.05,  # slow trim that corrects model error
         "trim_min_pct": -15.0,
         "trim_max_pct": 40.0,
@@ -65,16 +63,18 @@ DEFAULTS = {
     "model": {
         # GPU temperature rise per watt at a given fan speed:
         #   rth(f) = rth_ref * (f_ref / f) ** k
-        # Defaults were measured on a DL380 Gen9 with a V100 SXM2 on a PCIe adapter:
-        #   ~18 % fans, 75 W -> 82 C ; 43 % fans, 150 W -> 65 C ; inlet 19 C.
-        "rth_ref_c_per_w": 0.307,
-        "f_ref_pct": 43.0,
-        "k": 1.16,
+        # Defaults were fitted with thermal_test.py on a DL380 Gen9 with two V100s
+        # (SXM2 on a PCIe adapter + PCIe), inlet 19 C, 13 settled points from 18 %
+        # to 80 % fans and 70-190 W (rms error 2.5 C, errs hot above 50 % fans).
+        "rth_ref_c_per_w": 0.247,
+        "f_ref_pct": 50.0,
+        "k": 1.06,
     },
     "anticipate": {
         # Read vLLM's /metrics so fans start before power or temperature rise.
         "vllm_metrics_url": "",       # e.g. http://127.0.0.1:8000/metrics
-        "busy_power_w": 150.0,        # assumed draw while a request is running
+        "busy_power_w": 100.0,        # assumed draw while a request is running
+                                      # (decode; prefill shows up in power at once)
     },
     "failsafe": {
         # If the iLO cannot be reached and the GPU is hot, cap GPU power instead.
@@ -253,8 +253,8 @@ class Controller:
         # the park floor from the last stop, so the first tick always sends.
         self.step = None
         self.trim = 0.0
-        self.prev = None              # (time, temp) for the trend
-        self.slope = 0.0              # degrees per second, smoothed
+        self.p_smooth = None          # smoothed max GPU power (W)
+        self.p_time = None
         self.last_high = 0.0
         self.last_down = 0.0
         self.last_sent = 0.0
@@ -271,38 +271,40 @@ class Controller:
         hot = max(gpus, key=lambda g: g["temp_c"])
         t = hot["temp_c"]
 
-        # Temperature trend (exponential smoothing of dT/dt).
-        if self.prev:
-            dt = max(now - self.prev[0], 1e-3)
-            self.slope = 0.7 * self.slope + 0.3 * ((t - self.prev[1]) / dt)
-        self.prev = (now, t)
-        t_pred = t + max(self.slope, 0.0) * c["lookahead_s"]
-
         # Feedforward: what fan speed the current (or about-to-be) power needs.
-        p_ff = max(g["power_w"] for g in gpus)
+        # Prefill power swings 140-230 W second to second; the GPU only feels the
+        # average, so smooth it (still far faster than the ~1 min thermal lag).
+        p_now = max(g["power_w"] for g in gpus)
+        if self.p_smooth is None or c["power_tau_s"] <= 0:
+            self.p_smooth = p_now
+        else:
+            alpha = 1.0 - math.exp(-max(now - self.p_time, 0.0) / c["power_tau_s"])
+            self.p_smooth += alpha * (p_now - self.p_smooth)
+        self.p_time = now
+        p_ff = self.p_smooth
         if busy:
             p_ff = max(p_ff, a["busy_power_w"])
         ff = fan_needed(self.cfg, p_ff, c["target_c"], c["ambient_c"])
 
-        # Feedback: slow trim on the actual error, plus a push on predicted overshoot.
+        # Feedback: a slow trim on the actual error corrects model error (dust, a warm
+        # room). There is deliberately no trend term: right after a load starts the
+        # GPU warms fast because the fans were low a moment ago, and extrapolating that
+        # sent the fans to 100 % for loads the feedforward already covered.
         err = t - c["target_c"]
         if err > 0 or self.trim > 0:
             self.trim += c["ki_pct_per_c_s"] * err * c["interval_s"]
         else:
             self.trim *= 0.98  # drift back toward zero when comfortably cool
         self.trim = min(max(self.trim, c["trim_min_pct"]), c["trim_max_pct"])
-        push = 0.0
-        if t >= c["target_c"] - c["push_within_c"]:
-            push = c["kp_pct_per_c"] * max(0.0, t_pred - c["target_c"])
 
-        want = ff + self.trim + push
+        want = ff + self.trim
         idle = (p_ff < c["idle_power_w"] and not busy and t < c["target_c"] - 10)
         if idle:
             want = 0.0
         if t >= c["emergency_c"]:
             want = 100.0
-        return want, {"temp": t, "pred": t_pred, "power": p_ff, "ff": ff,
-                      "trim": self.trim, "push": push, "busy": busy}
+        return want, {"temp": t, "power": p_ff, "ff": ff,
+                      "trim": self.trim, "busy": busy}
 
     def quantize(self, want):
         if want <= 0:
@@ -340,8 +342,8 @@ class Controller:
             why = "change" if changed else "reapply"
             old = "?" if self.step is None else self.step
             log(f"floor {old}% -> {new}% ({why}) gpu {d['temp']:.0f}C "
-                f"pred {d['pred']:.0f}C {d['power']:.0f}W want {want:.0f}% "
-                f"(ff {d['ff']:.0f} trim {d['trim']:+.0f} push {d['push']:.0f}"
+                f"{d['power']:.0f}W want {want:.0f}% "
+                f"(ff {d['ff']:.0f} trim {d['trim']:+.0f}"
                 f"{' busy' if d['busy'] else ''})")
             if self.ilo.set_floor(new):
                 self.step = new
@@ -355,7 +357,7 @@ class Controller:
             log(f"status gpu {d['temp']:.0f}C {d['power']:.0f}W floor {self.step}% "
                 f"want {want:.0f}%{' busy' if d['busy'] else ''}")
         if self.csv:
-            self.csv.write(f"{time.time():.0f},{d['temp']:.1f},{d['pred']:.1f},{d['power']:.1f},"
+            self.csv.write(f"{time.time():.0f},{d['temp']:.1f},{d['ff']:.1f},{d['power']:.1f},"
                            f"{int(bool(d['busy']))},{want:.1f},{self.step}\n")
 
     def failsafe(self, gpus, temp):

@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 
 install -d /opt/ilo-fan /etc/ilo-fan
 chmod 700 /etc/ilo-fan
-install -m 755 ilo_fan.py /opt/ilo-fan/ilo_fan.py
+install -m 755 ilo_fan.py thermal_test.py /opt/ilo-fan/
 
 # paramiko 4+ dropped diffie-hellman-group14-sha1 and ssh-rsa host keys, the only
 # ones iLO 4 offers, so pin 3.x.

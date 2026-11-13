@@ -15,6 +15,8 @@ the `fan` SSH command. All credit for the firmware work goes to that project, th
 
 - **[docs/flashing-guide.md](docs/flashing-guide.md)**: step-by-step flashing for a DL380 Gen9.
 - **[ilo_fan.py](ilo_fan.py)**: the controller (Python 3.11+, needs `paramiko`).
+- **[thermal_test.py](thermal_test.py)**: load test that measures GPU temperature
+  against fan speed, fits the controller's model and checks the result.
 
 ## Without the mod: Increased Cooling
 
@@ -45,30 +47,42 @@ count) and works out a fan floor from three parts:
    request starting; temperature takes about a minute to follow. The steady-state
    temperature is roughly
 
-   `T = ambient + power × Rth(fan%)`, with `Rth(f) = 0.307 × (43 / f)^1.16` °C/W
+   `T = ambient + power × Rth(fan%)`, with `Rth(f) = 0.247 × (50 / f)^1.06` °C/W
 
-   fitted from our two measurements above. The script picks the fan speed whose
-   predicted steady state stays at the target (70 °C by default). At 150 W that is
-   about 41 %; idle (37 W) needs nothing.
+   and `ambient` = 25 °C. That is the air the GPUs actually see: the iLO inlet read
+   19 °C, the rest is heat picked up inside the chassis. The numbers come from
+   `thermal_test.py` (13 settled points, both GPUs, fans 18-80 %, 70-190 W, 2.5 °C
+   rms; it errs slightly hot at high fan speeds, which is the safe side). The script
+   picks the fan speed whose predicted steady state stays at the target (70 °C by
+   default): about 28 % for decode (100 W), 42 % at 150 W, 52 % for heavy prefill
+   (190 W). Idle (35-40 W) needs nothing.
+
+   GPU power is smoothed (`power_tau_s`, 20 s) before it goes into the model.
+   Prefill power swings between ~100 and 230 W from second to second, and the
+   temperature only follows the average.
 2. **vLLM anticipation.** If `vllm_metrics_url` is set, a running or queued request
-   counts as full power (`busy_power_w`) right away, before the GPU even ramps.
-3. **Feedback.** A slow integral trim corrects the model if the GPU runs hotter than
-   predicted (dust, warm room), and a proportional push acts on the temperature
-   trend 30 seconds ahead. The push only starts within 10 °C of the target: right
-   after a load starts the GPU warms fast and then levels off, so projecting those
-   first seconds forward predicts far too hot and sent the fans to 100 % for a
-   17-second request.
+   counts as `busy_power_w` (100 W, the decode level) right away, before the GPU even
+   ramps. That sets a ~28 % floor; heavier prompts raise it as soon as the measured
+   power follows.
+3. **Feedback.** A slow integral trim raises the floor if the GPU runs hotter than
+   the model predicts (dust, a warm room) and lets it drift back when it doesn't.
+   There is no trend term: an earlier version projected the temperature trend 30 s
+   ahead, but right after a load starts the GPU warms fast because the fans were
+   still low, so it kept predicting far too hot and sent the fans to 100 % for loads
+   the feedforward already covered. A load step can overshoot the target by a few
+   degrees for a minute; the GPU only throttles in the 80s.
 
-The result is rounded **up** to a step (`0, 30, 40, 50, 65, 80, 100 %`, where 0 means
-"stock iLO curve"):
+The result is rounded **up** to a step (`0, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80,
+100 %`, where 0 means "stock iLO curve"):
 
 - **Up:** immediately.
 - **Down:** only after `hold_s` (120 s) without high demand, then one step every 30 s.
   Chat traffic comes in bursts; this stops the fans from hunting.
 - **Emergency:** at 84 °C every configured fan goes to 100 %.
 
-In a dry run on our server, a request arrived and the floor went to 50 % on the first
-check while the GPU was still at 37 °C, about a minute before the heat arrived.
+When a request arrives, the floor goes to the decode level on the first check while
+the GPU is still cool; a heavy prompt raises it within seconds as the measured power
+follows, about a minute before the heat arrives.
 
 ### Talking to the iLO
 
@@ -139,10 +153,23 @@ uses the defaults in `ilo_fan.py`.
 - **`target_c`**: lower for more cooling and noise, higher for quiet.
 - **`fans`**: start with all six. If you learn which fans sit in front of the GPU's
   riser, list only those and the rest stay on the stock curve.
-- **Model (`rth_ref_c_per_w`, `f_ref_pct`, `k`)**: other hardware needs its own
-  numbers. Set `[log] csv`, run steady loads at two fan floors (`ilo_fan.py set 30`,
-  later `set 60`), note GPU power and settled temperature, and solve
-  `Rth = (T - ambient) / power` at each; `k = ln(Rth1/Rth2) / ln(f2/f1)`.
+- **Model (`ambient_c`, `rth_ref_c_per_w`, `f_ref_pct`, `k`)**: other hardware needs
+  its own numbers. With vLLM running, as root:
+  ```bash
+  /opt/ilo-fan/venv/bin/python /opt/ilo-fan/thermal_test.py all
+  ```
+  It stops `ilo-fan.service`, holds fixed fan floors (80 % down to 30 %) under heavy
+  prefill and decode load until the GPUs settle, fits the model to every GPU's
+  settled temperature and power, then runs the real controller with the fitted model
+  through prefill, decode, single-stream and bursty load with idle gaps. It takes
+  2-3 hours and starts the service again at the end (also on errors or Ctrl-C).
+  Results, `fit.json` and a `summary.txt` land in `/root/thermal-test/<time>/`;
+  copy the fitted numbers into `ilo-fan.toml`. `calibrate` and `validate` run the
+  halves on their own; `validate --set model.k=1.1` tries other values.
+- **`busy_power_w`**: the power assumed while vLLM has a request but the GPU hasn't
+  ramped yet. Use the decode level (`thermal_test.py` reports it): heavy prompts are
+  caught by the measured power a second later anyway, and a prefill-level number
+  keeps the fans high through every short chat.
 - **`hold_s`**: longer if the fans step down and up again between requests.
 
 ## Files
@@ -150,6 +177,7 @@ uses the defaults in `ilo_fan.py`.
 | File | Purpose |
 |---|---|
 | `ilo_fan.py` | controller and CLI (`run`, `trust`, `test`, `probe`, `status`, `set`) |
+| `thermal_test.py` | load test: calibrate and fit the thermal model, validate the controller |
 | `ilo-fan.toml.example` | config template |
 | `ilo-fan.service` | systemd unit |
 | `install.sh` | installer |
