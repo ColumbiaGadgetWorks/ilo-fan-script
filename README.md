@@ -74,6 +74,8 @@ check while the GPU was still at 37 °C, about a minute before the heat arrived.
   iLO is only contacted when the step changes.
 - Uses **paramiko**, not the `ssh` binary: OpenSSH 10.x can't negotiate with iLO 4
   ([ilo4_unlock#52](https://github.com/kendallgoto/ilo4_unlock/issues/52)).
+  It is pinned to paramiko 3.x: 4.0 and later dropped `diffie-hellman-group14-sha1`
+  and `ssh-rsa` host keys, the only ones iLO 4 offers.
 - Key-based login with a dedicated iLO user; the host key is pinned (`trust` once).
 - `fan` settings vanish on any iLO reset, so the current floor is resent every 5 minutes.
 
@@ -104,6 +106,10 @@ This puts the script in `/opt/ilo-fan` (own venv with paramiko), creates
 2. In the iLO web page, create a user for the script (Administration > User
    Administration) and add the printed public key to it (Administration > Security >
    Secure Shell Key > Authorize New Key).
+   The user only needs the **Login** and **Configure iLO Settings** privileges to
+   run `fan` commands. iLO 4 only lets an account with every privilege import an
+   SSH key for itself, so if you import the key as that user, give it full rights
+   for the import and remove the extras afterwards.
 3. Check the connection and the patch:
    ```bash
    F=/opt/ilo-fan/venv/bin/python; S=/opt/ilo-fan/ilo_fan.py

@@ -9,13 +9,15 @@ install -d /opt/ilo-fan /etc/ilo-fan
 chmod 700 /etc/ilo-fan
 install -m 755 ilo_fan.py /opt/ilo-fan/ilo_fan.py
 
+# paramiko 4+ dropped diffie-hellman-group14-sha1 and ssh-rsa host keys, the only
+# ones iLO 4 offers, so pin 3.x.
 if [ ! -x /opt/ilo-fan/venv/bin/python ]; then
   if command -v uv >/dev/null; then
     uv venv -q /opt/ilo-fan/venv
-    uv pip install -q -p /opt/ilo-fan/venv/bin/python paramiko
+    uv pip install -q -p /opt/ilo-fan/venv/bin/python "paramiko>=3.4,<4"
   else
     python3 -m venv /opt/ilo-fan/venv
-    /opt/ilo-fan/venv/bin/pip install -q paramiko
+    /opt/ilo-fan/venv/bin/pip install -q "paramiko>=3.4,<4"
   fi
 fi
 
