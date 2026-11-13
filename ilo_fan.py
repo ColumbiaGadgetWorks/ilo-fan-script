@@ -247,7 +247,9 @@ class Controller:
         self.cfg, self.ilo = cfg, ilo
         c = cfg["control"]
         self.steps = sorted(set(c["steps_pct"]) | {0})
-        self.step = 0                 # current floor, in % (0 = stock)
+        # Current floor in % (0 = stock). None = unknown: the iLO may still hold
+        # the park floor from the last stop, so the first tick always sends.
+        self.step = None
         self.trim = 0.0
         self.prev = None              # (time, temp) for the trend
         self.slope = 0.0              # degrees per second, smoothed
@@ -314,7 +316,10 @@ class Controller:
         target_step = self.quantize(want)
 
         new = self.step
-        if target_step > self.step:
+        if self.step is None:
+            new = target_step                   # first send after start
+            self.last_high = now
+        elif target_step > self.step:
             new = target_step                   # ramp up at once
             self.last_high = now
         elif target_step == self.step:
@@ -326,10 +331,11 @@ class Controller:
             self.last_down = now
 
         changed = new != self.step
-        due = self.step > 0 and now - self.last_sent >= c["reapply_s"]
+        due = bool(self.step) and now - self.last_sent >= c["reapply_s"]
         if (changed or due) and now >= self.retry_at:
             why = "change" if changed else "reapply"
-            log(f"floor {self.step}% -> {new}% ({why}) gpu {d['temp']:.0f}C "
+            old = "?" if self.step is None else self.step
+            log(f"floor {old}% -> {new}% ({why}) gpu {d['temp']:.0f}C "
                 f"pred {d['pred']:.0f}C {d['power']:.0f}W want {want:.0f}% "
                 f"(ff {d['ff']:.0f} trim {d['trim']:+.0f} push {d['push']:.0f}"
                 f"{' busy' if d['busy'] else ''})")
