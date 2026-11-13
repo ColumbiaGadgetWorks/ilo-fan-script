@@ -52,6 +52,8 @@ DEFAULTS = {
         "step_down_every_s": 30, # then step down one level at a time
         "lookahead_s": 30,       # predict temperature this far ahead from the trend
         "kp_pct_per_c": 4.0,     # extra floor per degree of predicted overshoot
+        "push_within_c": 10.0,   # push only once the GPU is this close to target
+                                 # (a load step's first seconds extrapolate far too hot)
         "ki_pct_per_c_s": 0.05,  # slow trim that corrects model error
         "trim_min_pct": -15.0,
         "trim_max_pct": 40.0,
@@ -289,7 +291,9 @@ class Controller:
         else:
             self.trim *= 0.98  # drift back toward zero when comfortably cool
         self.trim = min(max(self.trim, c["trim_min_pct"]), c["trim_max_pct"])
-        push = c["kp_pct_per_c"] * max(0.0, t_pred - c["target_c"])
+        push = 0.0
+        if t >= c["target_c"] - c["push_within_c"]:
+            push = c["kp_pct_per_c"] * max(0.0, t_pred - c["target_c"])
 
         want = ff + self.trim + push
         idle = (p_ff < c["idle_power_w"] and not busy and t < c["target_c"] - 10)

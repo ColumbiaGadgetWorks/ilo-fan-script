@@ -54,7 +54,10 @@ count) and works out a fan floor from three parts:
    counts as full power (`busy_power_w`) right away, before the GPU even ramps.
 3. **Feedback.** A slow integral trim corrects the model if the GPU runs hotter than
    predicted (dust, warm room), and a proportional push acts on the temperature
-   trend 30 seconds ahead.
+   trend 30 seconds ahead. The push only starts within 10 °C of the target: right
+   after a load starts the GPU warms fast and then levels off, so projecting those
+   first seconds forward predicts far too hot and sent the fans to 100 % for a
+   17-second request.
 
 The result is rounded **up** to a step (`0, 30, 40, 50, 65, 80, 100 %`, where 0 means
 "stock iLO curve"):
